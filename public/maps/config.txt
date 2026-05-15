@@ -1,0 +1,2 @@
+default biathlon.png
+biathlon.png 2500 1500
