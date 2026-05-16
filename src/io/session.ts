@@ -164,8 +164,8 @@ function parsePointMm(rawPoint: unknown, map: MapSpec): PointPx | null {
 
   return relativeMmToWorld(
     {
-      xMm: clamp(xMm, 0, map.realWidthMm),
-      yMm: clamp(yMm, 0, map.realHeightMm),
+      xMm: clamp(xMm, 0, map.realHeightMm),
+      yMm: clamp(yMm, 0, map.realWidthMm),
     },
     map,
   );

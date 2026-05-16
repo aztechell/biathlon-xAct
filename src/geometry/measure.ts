@@ -33,9 +33,10 @@ export function screenToWorld(point: PointPx, view: ViewState): PointPx {
 }
 
 export function worldToRelativeMm(point: PointPx, map: MapSpec): RelativePointMm {
+  // Robot coordinates use X for vertical map position and Y for horizontal map position.
   return {
-    xMm: point.x * mmPerPxX(map),
-    yMm: map.realHeightMm - point.y * mmPerPxY(map),
+    xMm: map.realHeightMm - point.y * mmPerPxY(map),
+    yMm: point.x * mmPerPxX(map),
   };
 }
 
@@ -59,8 +60,8 @@ export function worldToCoordinateModeMm(
 
 export function relativeMmToWorld(point: RelativePointMm, map: MapSpec): PointPx {
   return {
-    x: point.xMm / mmPerPxX(map),
-    y: (map.realHeightMm - point.yMm) / mmPerPxY(map),
+    x: point.yMm / mmPerPxX(map),
+    y: (map.realHeightMm - point.xMm) / mmPerPxY(map),
   };
 }
 
