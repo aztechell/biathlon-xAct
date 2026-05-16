@@ -1,4 +1,4 @@
-import { mmPerPxX, mmPerPxY, worldToCoordinateModeMm, worldToRelativeMm, worldToScreen } from "../geometry/measure";
+import { mmPerPxX, mmPerPxY, worldToCoordinateModeMm, worldToScreen } from "../geometry/measure";
 import type { LoadedMap } from "../io/mapConfig";
 import type { CoordinateMode, MapSpec, PointPx, Polyline, RobotPlaybackFrame, ViewState } from "../state/types";
 
@@ -91,7 +91,8 @@ export class CanvasRenderer {
     if (scene.showPointer && scene.pointerWorld) {
       this.drawPointerCrosshair(scene.pointerWorld, view);
       if (this.isInsideMap(scene.pointerWorld, map)) {
-        this.drawPointerBadge(scene.pointerWorld, map, view);
+        const originPoint = scene.coordinateMode === "relative" ? scene.draftPolyline[0] ?? null : null;
+        this.drawPointerBadge(scene.pointerWorld, map, view, scene.coordinateMode, originPoint);
       }
     }
   }
@@ -363,11 +364,17 @@ export class CanvasRenderer {
     ctx.restore();
   }
 
-  private drawPointerBadge(pointerWorld: PointPx, map: LoadedMap, view: ViewState): void {
+  private drawPointerBadge(
+    pointerWorld: PointPx,
+    map: LoadedMap,
+    view: ViewState,
+    coordinateMode: CoordinateMode,
+    originPoint: PointPx | null,
+  ): void {
     const ctx = this.ctx;
     const screen = worldToScreen(pointerWorld, view);
-    const relative = worldToRelativeMm(pointerWorld, map.spec);
-    const text = `X ${Math.round(relative.xMm)}  Y ${Math.round(relative.yMm)}`;
+    const coordinate = worldToCoordinateModeMm(pointerWorld, map.spec, coordinateMode, originPoint);
+    const text = `X ${Math.round(coordinate.xMm)}  Y ${Math.round(coordinate.yMm)}`;
 
     ctx.save();
     ctx.font = "12px 'Segoe UI', sans-serif";
