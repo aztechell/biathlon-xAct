@@ -9,27 +9,28 @@ import type {
   RelativePointMm,
 } from "../state/types";
 
-const SESSION_APP_ID = "biathlon-xact";
-const SESSION_VERSION = 1;
+const AUTOSAVE_APP_ID = "biathlon-xact";
+const AUTOSAVE_VERSION = 1;
 const MAX_DRIVE_SPEED = 100;
 const DEFAULT_DRIVE_SPEED = 90;
 const DEFAULT_ROBOT_SIZE_MM = 250;
 const ANIMATION_SPEED_MULTIPLIERS = [2, 4, 8, 16] as const;
 
-export interface ImportedSession {
+export interface RestoredAutosave {
   polylines: Polyline[];
+  draftPolyline: PointPx[];
   polylineSettings: PolylineSettings;
   robotEnabled: boolean;
   robotWidthMm: number;
   robotHeightMm: number;
   robotCodeOverride: string | null;
+  isSettingInitialHeading: boolean;
   warnings: string[];
 }
 
-interface SessionV1 {
+interface AutosaveV1 {
   version: 1;
   app: string;
-  exportedAt: string;
   map: {
     id: string;
     filename: string;
@@ -40,20 +41,26 @@ interface SessionV1 {
     id: string;
     pointsMm: RelativePointMm[];
   }>;
+  draftPolylineMm: RelativePointMm[];
   settings: PolylineSettings;
   robot: {
     enabled: boolean;
     widthMm: number;
     heightMm: number;
   };
-  robotCode?: string | null;
+  robotCodeOverride: string | null;
+  isSettingInitialHeading: boolean;
 }
 
-export function serializeSession(state: AppState, map: MapSpec, robotCodeOverride: string | null = null): string {
-  const session: SessionV1 = {
-    version: SESSION_VERSION,
-    app: SESSION_APP_ID,
-    exportedAt: new Date().toISOString(),
+export function serializeAutosave(
+  state: AppState,
+  map: MapSpec,
+  robotCodeOverride: string | null,
+  isSettingInitialHeading: boolean,
+): string {
+  const autosave: AutosaveV1 = {
+    version: AUTOSAVE_VERSION,
+    app: AUTOSAVE_APP_ID,
     map: {
       id: map.id,
       filename: map.filename,
@@ -62,8 +69,9 @@ export function serializeSession(state: AppState, map: MapSpec, robotCodeOverrid
     },
     polylines: state.polylines.map((polyline) => ({
       id: polyline.id,
-      pointsMm: polyline.points.map((point) => toSessionMm(worldToRelativeMm(point, map))),
+      pointsMm: polyline.points.map((point) => toAutosaveMm(worldToRelativeMm(point, map))),
     })),
+    draftPolylineMm: state.draftPolyline.map((point) => toAutosaveMm(worldToRelativeMm(point, map))),
     settings: {
       orthoVh: state.polylineSettings.orthoVh,
       round10mm: state.polylineSettings.round10mm,
@@ -78,17 +86,18 @@ export function serializeSession(state: AppState, map: MapSpec, robotCodeOverrid
       widthMm: normalizePositiveNumber(state.robotWidthMm, DEFAULT_ROBOT_SIZE_MM),
       heightMm: normalizePositiveNumber(state.robotHeightMm, DEFAULT_ROBOT_SIZE_MM),
     },
-    robotCode: normalizeRobotCode(robotCodeOverride),
+    robotCodeOverride,
+    isSettingInitialHeading: isSettingInitialHeading && state.draftPolyline.length === 1,
   };
 
-  return `${JSON.stringify(session, null, 2)}\n`;
+  return JSON.stringify(autosave);
 }
 
-export function parseSession(json: string, currentMap: MapSpec): ImportedSession {
+export function parseAutosave(json: string, currentMap: MapSpec): RestoredAutosave {
   const raw = parseJsonObject(json);
   const version = readNumber(raw.version);
-  if (version !== SESSION_VERSION) {
-    throw new Error(`Unsupported session version: ${Number.isFinite(version) ? version : "missing"}`);
+  if (version !== AUTOSAVE_VERSION) {
+    throw new Error(`Unsupported autosave version: ${Number.isFinite(version) ? version : "missing"}`);
   }
 
   const warnings: string[] = [];
@@ -97,53 +106,51 @@ export function parseSession(json: string, currentMap: MapSpec): ImportedSession
   const mapHeight = readNumber(rawMap.realHeightMm);
   if (!isSameSize(mapWidth, currentMap.realWidthMm) || !isSameSize(mapHeight, currentMap.realHeightMm)) {
     throw new Error(
-      `Session map size ${mapWidth} x ${mapHeight} mm does not match current map ${currentMap.realWidthMm} x ${currentMap.realHeightMm} mm`,
+      `Autosave map size ${mapWidth} x ${mapHeight} mm does not match current map ${currentMap.realWidthMm} x ${currentMap.realHeightMm} mm`,
     );
   }
 
   const filename = typeof rawMap.filename === "string" ? rawMap.filename : "";
   if (filename && filename !== currentMap.filename) {
-    warnings.push(`Imported session was exported for ${filename}, current map is ${currentMap.filename}`);
+    warnings.push(`Autosave was created for ${filename}, current map is ${currentMap.filename}`);
   }
 
   const settings = parseSettings(readOptionalObject(raw.settings));
   const robot = parseRobot(readOptionalObject(raw.robot));
   const polylines = parsePolylines(raw.polylines, currentMap, warnings);
-  const robotCodeOverride = normalizeRobotCode(
-    typeof raw.robotCode === "string"
-      ? raw.robotCode
-      : typeof raw.robotCodeOverride === "string"
-        ? raw.robotCodeOverride
-        : null,
-  );
+  const draftPolyline = parseDraftPolyline(raw.draftPolylineMm, currentMap, warnings);
+  const robotCodeOverride = typeof raw.robotCodeOverride === "string" ? raw.robotCodeOverride : null;
+  const isSettingInitialHeading = readBoolean(raw.isSettingInitialHeading, false) && draftPolyline.length === 1;
 
   return {
     polylines,
+    draftPolyline,
     polylineSettings: settings,
     robotEnabled: robot.enabled,
     robotWidthMm: robot.widthMm,
     robotHeightMm: robot.heightMm,
     robotCodeOverride,
+    isSettingInitialHeading,
     warnings,
   };
 }
 
 function parsePolylines(rawPolylines: unknown, map: MapSpec, warnings: string[]): Polyline[] {
   if (!Array.isArray(rawPolylines)) {
-    throw new Error("Session polylines must be an array");
+    return [];
   }
 
   const usedIds = new Set<string>();
   const polylines: Polyline[] = [];
   rawPolylines.forEach((rawPolyline, index) => {
     if (!isRecord(rawPolyline)) {
-      warnings.push(`Polyline ${index + 1} skipped: invalid object`);
+      warnings.push(`Autosave polyline ${index + 1} skipped: invalid object`);
       return;
     }
 
     const rawPoints = rawPolyline.pointsMm;
     if (!Array.isArray(rawPoints)) {
-      warnings.push(`Polyline ${index + 1} skipped: pointsMm is missing`);
+      warnings.push(`Autosave polyline ${index + 1} skipped: pointsMm is missing`);
       return;
     }
 
@@ -152,7 +159,7 @@ function parsePolylines(rawPolylines: unknown, map: MapSpec, warnings: string[])
       return point ? [point] : [];
     });
     if (points.length < 2) {
-      warnings.push(`Polyline ${index + 1} skipped: fewer than 2 valid points`);
+      warnings.push(`Autosave polyline ${index + 1} skipped: fewer than 2 valid points`);
       return;
     }
 
@@ -163,6 +170,21 @@ function parsePolylines(rawPolylines: unknown, map: MapSpec, warnings: string[])
   });
 
   return polylines;
+}
+
+function parseDraftPolyline(rawPoints: unknown, map: MapSpec, warnings: string[]): PointPx[] {
+  if (!Array.isArray(rawPoints)) {
+    return [];
+  }
+
+  const points = rawPoints.flatMap((rawPoint) => {
+    const point = parsePointMm(rawPoint, map);
+    return point ? [point] : [];
+  });
+  if (points.length !== rawPoints.length) {
+    warnings.push("Autosave draft polyline had invalid points");
+  }
+  return points;
 }
 
 function parsePointMm(rawPoint: unknown, map: MapSpec): PointPx | null {
@@ -205,7 +227,7 @@ function parseRobot(rawRobot: Record<string, unknown> | null): { enabled: boolea
 }
 
 function normalizePolylineId(rawId: unknown, index: number, usedIds: Set<string>): string {
-  const base = typeof rawId === "string" && rawId.trim() ? rawId.trim() : `polyline-import-${index + 1}`;
+  const base = typeof rawId === "string" && rawId.trim() ? rawId.trim() : `polyline-autosave-${index + 1}`;
   let id = base;
   let suffix = 2;
   while (usedIds.has(id)) {
@@ -216,14 +238,14 @@ function normalizePolylineId(rawId: unknown, index: number, usedIds: Set<string>
   return id;
 }
 
-function toSessionMm(point: RelativePointMm): RelativePointMm {
+function toAutosaveMm(point: RelativePointMm): RelativePointMm {
   return {
-    xMm: toSessionNumber(point.xMm),
-    yMm: toSessionNumber(point.yMm),
+    xMm: toAutosaveNumber(point.xMm),
+    yMm: toAutosaveNumber(point.yMm),
   };
 }
 
-function toSessionNumber(value: number): number {
+function toAutosaveNumber(value: number): number {
   return Number(value.toFixed(3));
 }
 
@@ -233,18 +255,18 @@ function parseJsonObject(json: string): Record<string, unknown> {
     parsed = JSON.parse(json);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid JSON: ${message}`);
+    throw new Error(`Invalid autosave JSON: ${message}`);
   }
 
   if (!isRecord(parsed)) {
-    throw new Error("Session JSON must be an object");
+    throw new Error("Autosave JSON must be an object");
   }
   return parsed;
 }
 
 function readObject(value: unknown, fieldName: string): Record<string, unknown> {
   if (!isRecord(value)) {
-    throw new Error(`Session ${fieldName} must be an object`);
+    throw new Error(`Autosave ${fieldName} must be an object`);
   }
   return value;
 }
@@ -279,13 +301,6 @@ function normalizeHeadingDeg(value: number): number {
 
 function normalizePositiveNumber(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.round(value) : fallback;
-}
-
-function normalizeRobotCode(value: string | null): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  return value.trim() ? value : null;
 }
 
 function isSameSize(a: number, b: number): boolean {

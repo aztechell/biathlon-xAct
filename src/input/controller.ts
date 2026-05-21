@@ -15,6 +15,7 @@ export interface InputControllerOptions {
   getActiveMap: () => LoadedMap | null;
   getToolMode: () => ToolMode;
   getPolylineSettings: () => PolylineSettings;
+  isSettingInitialHeading: () => boolean;
   getViewportSize: () => { width: number; height: number };
   requestRender: () => void;
   onResetView: () => void;
@@ -44,6 +45,7 @@ export class InputController {
   private readonly getActiveMap: () => LoadedMap | null;
   private readonly getToolMode: () => ToolMode;
   private readonly getPolylineSettings: () => PolylineSettings;
+  private readonly isSettingInitialHeading: () => boolean;
   private readonly getViewportSize: () => { width: number; height: number };
   private readonly requestRender: () => void;
   private readonly onResetView: () => void;
@@ -74,6 +76,7 @@ export class InputController {
     this.getActiveMap = options.getActiveMap;
     this.getToolMode = options.getToolMode;
     this.getPolylineSettings = options.getPolylineSettings;
+    this.isSettingInitialHeading = options.isSettingInitialHeading;
     this.getViewportSize = options.getViewportSize;
     this.requestRender = options.requestRender;
     this.onResetView = options.onResetView;
@@ -138,6 +141,16 @@ export class InputController {
       if (!activeMap) {
         return;
       }
+      if (this.isSettingInitialHeading()) {
+        this.onCancelPolyline();
+        this.requestRender();
+        return;
+      }
+      if (toolMode === "polyline" && this.store.getState().draftPolyline.length >= 2) {
+        this.onFinishPolyline();
+        this.requestRender();
+        return;
+      }
       const point = this.getCanvasPoint(event);
       this.updatePointer(point);
       const world = screenToWorld(point, this.store.getState().view);
@@ -147,8 +160,8 @@ export class InputController {
       if (this.onDeletePolylineAt(world)) {
         return;
       }
-      if (toolMode === "polyline") {
-        this.onFinishPolyline();
+      if (toolMode === "polyline" && this.store.getState().draftPolyline.length > 0) {
+        this.onUndoPolylinePoint();
       }
       return;
     }
@@ -163,6 +176,10 @@ export class InputController {
         return;
       }
       const world = screenToWorld(point, this.store.getState().view);
+      if (this.isSettingInitialHeading()) {
+        this.onAddPolylinePoint(clampWorldToMap(world, activeMap.spec));
+        return;
+      }
       const pointTarget = this.findPointTargetAt(world);
       if (pointTarget) {
         this.movingPointTarget = pointTarget;

@@ -32,6 +32,18 @@ export interface RobotPlaybackFrame {
   headingRad: number;
 }
 
+export interface RobotTurnMarker {
+  position: PointPx;
+  headingRad: number;
+  headingDeg: number;
+}
+
+export interface RobotInitialHeadingMarker {
+  position: PointPx;
+  headingRad: number;
+  isPreview: boolean;
+}
+
 export type PolylinePointTarget =
   | {
       kind: "draft";
@@ -48,6 +60,7 @@ export interface PolylineSettings {
   round10mm: boolean;
   showPointCoordinates: boolean;
   coordinateMode: CoordinateMode;
+  initialHeadingDeg: number;
   driveSpeed: number;
   animationSpeedMultiplier: AnimationSpeedMultiplier;
 }

@@ -1,8 +1,9 @@
-import { worldToCoordinateModeMm } from "../geometry/measure";
+import { serializeRobotCodeMissions } from "../io/robotCode";
 import type { LoadedMap } from "../io/mapConfig";
 import type { AnimationSpeedMultiplier, CoordinateMode, PointPx, Polyline, ToolMode } from "../state/types";
 
 const MAX_DRIVE_SPEED = 100;
+const DEFAULT_DRIVE_SPEED = 90;
 const ANIMATION_SPEED_MULTIPLIERS = [2, 4, 8, 16] as const;
 
 export interface PolylinePanelState {
@@ -14,12 +15,15 @@ export interface PolylinePanelState {
   driveSpeed: number;
   animationSpeedMultiplier: AnimationSpeedMultiplier;
   playingPolylineId: string | null;
+  robotCodeOverride: string | null;
 }
 
 export interface PolylinePanelActions {
   onSpeedChange: (speed: number) => void;
   onAnimationSpeedChange: (multiplier: AnimationSpeedMultiplier) => void;
-  onPlayPolyline: (polylineId: string) => void;
+  onPlayPolyline: (polylineId: string, code: string) => void;
+  onApplyRobotCode: (code: string) => void;
+  onRobotCodeChange: (code: string) => void;
 }
 
 export class PolylinePanelView {
@@ -27,15 +31,20 @@ export class PolylinePanelView {
   private readonly toggleButton: HTMLButtonElement;
   private readonly resizeHandle: HTMLDivElement;
   private readonly title: HTMLDivElement;
+  private readonly playButtonsHost: HTMLDivElement;
   private readonly speedInput: HTMLInputElement;
   private readonly animationSpeedButtons: HTMLButtonElement[] = [];
+  private readonly applyButton: HTMLButtonElement;
+  private readonly codeEditor: HTMLTextAreaElement;
+  private readonly snippetBar: HTMLDivElement;
   private readonly body: HTMLDivElement;
   private readonly actions: PolylinePanelActions;
   private isOpen = false;
-  private currentSpeed = 100;
+  private currentSpeed = DEFAULT_DRIVE_SPEED;
   private dragStartX = 0;
   private dragStartWidth = 0;
   private activePointerId: number | null = null;
+  private isEditorDirty = false;
 
   constructor(host: HTMLElement, actions: PolylinePanelActions) {
     this.actions = actions;
@@ -58,6 +67,10 @@ export class PolylinePanelView {
 
     this.title = document.createElement("div");
     this.title.className = "polyline-panel-title";
+    this.title.setAttribute("aria-hidden", "true");
+
+    this.playButtonsHost = document.createElement("div");
+    this.playButtonsHost.className = "polyline-play-buttons";
 
     const speedControl = document.createElement("label");
     speedControl.className = "polyline-panel-speed";
@@ -94,22 +107,61 @@ export class PolylinePanelView {
 
     this.body = document.createElement("div");
     this.body.className = "polyline-panel-body";
+    this.applyButton = document.createElement("button");
+    this.applyButton.type = "button";
+    this.applyButton.className = "polyline-apply-button";
+    this.applyButton.textContent = "Apply";
+    this.applyButton.title = "Apply robot code to map";
+    this.applyButton.addEventListener("click", () => {
+      this.applyCurrentCode();
+    });
+    this.codeEditor = document.createElement("textarea");
+    this.codeEditor.className = "polyline-code-editor";
+    this.codeEditor.spellcheck = false;
+    this.codeEditor.wrap = "off";
+    this.codeEditor.setAttribute("aria-label", "Robot code editor");
+    this.codeEditor.addEventListener("input", () => {
+      this.isEditorDirty = true;
+      this.actions.onRobotCodeChange(this.codeEditor.value);
+    });
+    this.codeEditor.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && event.ctrlKey) {
+        event.preventDefault();
+        this.applyCurrentCode();
+      }
+    });
+    this.snippetBar = document.createElement("div");
+    this.snippetBar.className = "polyline-snippet-bar";
+    this.snippetBar.append(
+      this.createSnippetButton("Drive", () => `robot.drive_to_point_action(0, 0, ${this.currentSpeed}),`),
+      this.createSnippetButton("Turn", () => "robot.turn_to_heading_action(0),"),
+      this.createSnippetButton("Reset", () => "robot.reset_odometry_action(0, 0, 0),"),
+    );
 
     const header = document.createElement("div");
     header.className = "polyline-panel-header";
-    header.append(this.toggleButton, this.title, animationSpeedControl, speedControl);
+    header.append(
+      this.toggleButton,
+      this.playButtonsHost,
+      this.title,
+      animationSpeedControl,
+      speedControl,
+      this.applyButton,
+    );
 
+    this.body.append(this.codeEditor, this.snippetBar);
     this.root.append(this.resizeHandle, header, this.body);
     host.appendChild(this.root);
     this.update({
       map: null,
-      toolMode: "pan",
+      toolMode: "polyline",
       polylines: [],
       draftPolyline: [],
-      coordinateMode: "absolute",
+      coordinateMode: "relative",
       driveSpeed: this.currentSpeed,
       animationSpeedMultiplier: 2,
       playingPolylineId: null,
+      robotCodeOverride: null,
     });
   }
 
@@ -145,67 +197,105 @@ export class PolylinePanelView {
           ]
         : []),
     ];
-    const shouldShow = sections.length > 0;
+    const shouldShow = state.map !== null || sections.length > 0;
     this.root.classList.toggle("visible", shouldShow);
 
     if (!shouldShow) {
       return;
     }
 
-    this.title.textContent = `${sections.length} polyline${sections.length === 1 ? "" : "s"}`;
-
-    this.body.replaceChildren();
+    this.updatePlayButtons(state);
     if (!state.map) {
-      this.body.textContent = "No map";
+      if (document.activeElement !== this.codeEditor) {
+        this.codeEditor.value = "";
+        this.codeEditor.placeholder = "No map";
+      }
       return;
     }
     const map = state.map;
+    const isEditorFocused = document.activeElement === this.codeEditor;
+    const code =
+      state.robotCodeOverride ??
+      (this.isEditorDirty && isEditorFocused ? this.codeEditor.value : null) ??
+      serializeRobotCodeMissions(
+        sections.map((section, index) => ({
+          title: section.isDraft ? "Mission draft" : `Mission ${index + 1}`,
+          points: section.points,
+        })),
+        map.spec,
+        state.coordinateMode,
+        normalizeSpeed(state.driveSpeed),
+      );
+    if (!isEditorFocused) {
+      this.codeEditor.value = code;
+      this.isEditorDirty = false;
+    }
+  }
 
-    for (const section of sections) {
-      const sectionElement = document.createElement("section");
-      sectionElement.className = "polyline-code-section";
+  getCurrentCode(): string {
+    return this.codeEditor.value;
+  }
 
-      const sectionHeader = document.createElement("div");
-      sectionHeader.className = "polyline-code-header";
+  private applyCurrentCode(): void {
+    const code = this.codeEditor.value;
+    this.actions.onApplyRobotCode(code);
+    this.isEditorDirty = false;
+    this.codeEditor.value = code;
+  }
 
-      if (!section.isDraft && section.id) {
-        const isPlaying = state.playingPolylineId === section.id;
-        const playButton = document.createElement("button");
-        playButton.type = "button";
-        playButton.className = "polyline-play-button";
-        playButton.classList.toggle("playing", isPlaying);
-        playButton.title = isPlaying ? "Stop robot playback" : "Play robot movement";
-        playButton.setAttribute("aria-label", isPlaying ? "Stop robot playback" : `Play ${section.title}`);
+  private createSnippetButton(label: string, createSnippet: () => string): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "polyline-snippet-button";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      this.insertSnippet(createSnippet());
+    });
+    return button;
+  }
+
+  private insertSnippet(snippet: string): void {
+    const value = this.codeEditor.value;
+    const start = this.codeEditor.selectionStart ?? value.length;
+    const end = this.codeEditor.selectionEnd ?? start;
+    const prefix = start > 0 && !value.slice(0, start).endsWith("\n") ? "\n" : "";
+    const suffix = end < value.length && !value.slice(end).startsWith("\n") ? "\n" : "";
+    const nextValue = `${value.slice(0, start)}${prefix}${snippet}${suffix}${value.slice(end)}`;
+    const nextCursor = start + prefix.length + snippet.length;
+    this.codeEditor.value = nextValue;
+    this.isEditorDirty = true;
+    this.actions.onRobotCodeChange(nextValue);
+    this.codeEditor.focus();
+    this.codeEditor.setSelectionRange(nextCursor, nextCursor);
+  }
+
+  private updatePlayButtons(state: PolylinePanelState): void {
+    this.root.classList.toggle("has-playback-control", state.polylines.length > 0);
+    this.playButtonsHost.replaceChildren(
+      ...state.polylines.map((polyline, index) => {
+        const isPlaying = state.playingPolylineId === polyline.id;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "polyline-play-button";
+        button.classList.toggle("playing", isPlaying);
+        button.title = isPlaying ? `Stop mission ${index + 1}` : `Play mission ${index + 1}`;
+        button.setAttribute("aria-label", isPlaying ? `Stop mission ${index + 1}` : `Play mission ${index + 1}`);
         const playIcon = document.createElement("span");
         playIcon.className = "polyline-play-icon";
         playIcon.setAttribute("aria-hidden", "true");
-        playButton.appendChild(playIcon);
-        playButton.addEventListener("click", () => {
-          if (section.id) {
-            this.actions.onPlayPolyline(section.id);
-          }
+        button.appendChild(playIcon);
+        if (state.polylines.length > 1) {
+          const indexBadge = document.createElement("span");
+          indexBadge.className = "polyline-play-index";
+          indexBadge.textContent = String(index + 1);
+          button.appendChild(indexBadge);
+        }
+        button.addEventListener("click", () => {
+          this.actions.onPlayPolyline(polyline.id, this.codeEditor.value);
         });
-        sectionHeader.appendChild(playButton);
-      }
-
-      const sectionTitle = document.createElement("div");
-      sectionTitle.className = "polyline-code-title";
-      sectionTitle.textContent = section.title;
-      sectionHeader.appendChild(sectionTitle);
-
-      const code = document.createElement("pre");
-      code.className = "polyline-point-code";
-      const originPoint = state.coordinateMode === "relative" ? section.points[0] : null;
-      const speed = normalizeSpeed(state.driveSpeed);
-      const lines = section.points.map((point) => {
-        const coordinate = worldToCoordinateModeMm(point, map.spec, state.coordinateMode, originPoint);
-        return `robot.drive_to_point_action(_X = ${Math.round(coordinate.xMm)}, _Y = ${Math.round(coordinate.yMm)}, speed = ${speed}),`;
-      });
-      code.textContent = lines.join("\n");
-
-      sectionElement.append(sectionHeader, code);
-      this.body.appendChild(sectionElement);
-    }
+        return button;
+      }),
+    );
   }
 
   private readonly onResizeStart = (event: PointerEvent): void => {

@@ -3,14 +3,26 @@ import type { LoadedMap } from "../io/mapConfig";
 import type { AnimationSpeedMultiplier, PointPx, Polyline, RobotPlaybackFrame } from "../state/types";
 
 const MAX_DRIVE_SPEED = 100;
-const ROBOT_TURN_SPEED_RAD_PER_SEC = Math.PI;
+const ROBOT_TURN_SPEED_RAD_PER_SEC = Math.PI / 2;
 const MIN_ROBOT_TURN_ANGLE_RAD = 0.02;
 
 type RobotPlaybackMode = "move" | "turn";
 
+export type RobotPlaybackAction =
+  | {
+      kind: "drive";
+      point: PointPx;
+    }
+  | {
+      kind: "turn";
+      headingRad: number;
+    };
+
 export interface RobotPlaybackControllerOptions {
   getActiveMap: () => LoadedMap | null;
   getPolylines: () => Polyline[];
+  getPlaybackActions: (polylineId: string) => RobotPlaybackAction[] | null;
+  getInitialHeadingRad: () => number;
   getDriveSpeed: () => number;
   getAnimationSpeedMultiplier: () => AnimationSpeedMultiplier;
   requestRender: () => void;
@@ -24,6 +36,13 @@ export class RobotPlaybackController {
   private playbackLastTimestampMs = 0;
   private playbackSegmentIndex = 0;
   private playbackSegmentOffsetMm = 0;
+  private playbackActions: RobotPlaybackAction[] = [];
+  private playbackActionIndex = 0;
+  private playbackCurrentPosition: PointPx | null = null;
+  private playbackMoveStart: PointPx | null = null;
+  private playbackMoveEnd: PointPx | null = null;
+  private playbackMoveLengthMm = 0;
+  private playbackHeadingRad = 0;
   private playbackMode: RobotPlaybackMode = "move";
   private playbackTurnFromHeadingRad = 0;
   private playbackTurnDeltaRad = 0;
@@ -47,22 +66,36 @@ export class RobotPlaybackController {
       return false;
     }
 
-    const firstSegmentIndex = this.findNextPlayableSegment(polyline.points, 0, activeMap);
-    if (firstSegmentIndex === null) {
+    const actions = this.options.getPlaybackActions(polylineId) ?? polyline.points.map((point) => ({ kind: "drive" as const, point }));
+    const firstDriveIndex = actions.findIndex((action) => action.kind === "drive");
+    if (firstDriveIndex < 0) {
+      return false;
+    }
+    const firstDrive = actions[firstDriveIndex];
+    if (firstDrive.kind !== "drive") {
       return false;
     }
 
     this.resetPlayback(false);
     this.playingPolylineId = polylineId;
     this.playbackMode = "move";
-    this.playbackSegmentIndex = firstSegmentIndex;
+    this.playbackActions = actions.map((action) =>
+      action.kind === "drive" ? { kind: "drive", point: { ...action.point } } : { kind: "turn", headingRad: action.headingRad },
+    );
+    this.playbackActionIndex = firstDriveIndex + 1;
+    this.playbackCurrentPosition = { ...firstDrive.point };
+    this.playbackHeadingRad = this.options.getInitialHeadingRad();
+    this.playbackSegmentIndex = 0;
     this.playbackSegmentOffsetMm = 0;
+    this.playbackMoveStart = null;
+    this.playbackMoveEnd = null;
+    this.playbackMoveLengthMm = 0;
     this.resetRobotTurnState();
     this.playbackLastTimestampMs = performance.now();
     this.robotPlaybackFrame = {
       polylineId,
-      position: { ...polyline.points[firstSegmentIndex] },
-      headingRad: this.headingRad(polyline.points[firstSegmentIndex], polyline.points[firstSegmentIndex + 1]),
+      position: { ...firstDrive.point },
+      headingRad: this.playbackHeadingRad,
     };
     this.playbackAnimationHandle = window.requestAnimationFrame(this.robotPlaybackTick);
     this.options.onPlaybackStateChange();
@@ -106,6 +139,13 @@ export class RobotPlaybackController {
     this.playbackLastTimestampMs = 0;
     this.playbackSegmentIndex = 0;
     this.playbackSegmentOffsetMm = 0;
+    this.playbackActions = [];
+    this.playbackActionIndex = 0;
+    this.playbackCurrentPosition = null;
+    this.playbackMoveStart = null;
+    this.playbackMoveEnd = null;
+    this.playbackMoveLengthMm = 0;
+    this.playbackHeadingRad = 0;
     this.playbackMode = "move";
     this.resetRobotTurnState();
     if (clearFrame) {
@@ -139,69 +179,106 @@ export class RobotPlaybackController {
       return;
     }
 
-    let remainingDistanceMm =
-      Math.max(1, this.normalizeDriveSpeed(this.options.getDriveSpeed())) *
-      this.options.getAnimationSpeedMultiplier() *
-      dtSec;
+    let remainingDistanceMm = this.distancePerTickMm(dtSec);
 
     while (remainingDistanceMm >= 0) {
-      if (this.playbackSegmentIndex >= polyline.points.length - 1) {
+      if (this.playbackMode === "move" && this.playbackMoveStart && this.playbackMoveEnd) {
+        if (!this.stepRobotMove(remainingDistanceMm)) {
+          return;
+        }
+        remainingDistanceMm = 0;
+        continue;
+      }
+
+      const startedMode = this.startNextPlaybackAction();
+      if (!startedMode) {
         this.finishRobotPlayback(polyline);
         return;
       }
-
-      const start = polyline.points[this.playbackSegmentIndex];
-      const end = polyline.points[this.playbackSegmentIndex + 1];
-      const segmentLengthMm = this.segmentLengthMm(start, end, activeMap);
-      if (segmentLengthMm <= 0.0001) {
-        this.playbackSegmentIndex += 1;
-        this.playbackSegmentOffsetMm = 0;
-        continue;
+      if (startedMode === "turn") {
+        this.options.requestRender();
+        this.playbackAnimationHandle = window.requestAnimationFrame(this.robotPlaybackTick);
+        return;
       }
-
-      const availableDistanceMm = segmentLengthMm - this.playbackSegmentOffsetMm;
-      if (remainingDistanceMm >= availableDistanceMm) {
-        remainingDistanceMm -= availableDistanceMm;
-        const nextSegmentIndex = this.findNextPlayableSegment(polyline.points, this.playbackSegmentIndex + 1, activeMap);
-        if (nextSegmentIndex === null) {
-          this.finishRobotPlayback(polyline);
-          return;
-        }
-
-        const currentHeading = this.headingRad(start, end);
-        const nextStart = polyline.points[nextSegmentIndex];
-        const nextEnd = polyline.points[nextSegmentIndex + 1];
-        const nextHeading = this.headingRad(nextStart, nextEnd);
-        const turnPosition = { ...nextStart };
-        this.robotPlaybackFrame = {
-          polylineId: this.playingPolylineId,
-          position: turnPosition,
-          headingRad: currentHeading,
-        };
-
-        if (this.startRobotTurn(turnPosition, currentHeading, nextHeading, nextSegmentIndex)) {
-          this.options.requestRender();
-          this.playbackAnimationHandle = window.requestAnimationFrame(this.robotPlaybackTick);
-          return;
-        }
-
-        this.playbackSegmentIndex = nextSegmentIndex;
-        this.playbackSegmentOffsetMm = 0;
-        continue;
-      }
-
-      this.playbackSegmentOffsetMm += remainingDistanceMm;
-      const t = this.playbackSegmentOffsetMm / segmentLengthMm;
-      this.robotPlaybackFrame = {
-        polylineId: this.playingPolylineId,
-        position: this.lerpPoint(start, end, t),
-        headingRad: this.headingRad(start, end),
-      };
-      this.options.requestRender();
-      this.playbackAnimationHandle = window.requestAnimationFrame(this.robotPlaybackTick);
-      return;
     }
   };
+
+  private distancePerTickMm(dtSec: number): number {
+    return (
+      Math.max(1, this.normalizeDriveSpeed(this.options.getDriveSpeed())) *
+      this.options.getAnimationSpeedMultiplier() *
+      dtSec
+    );
+  }
+
+  private startNextPlaybackAction(): RobotPlaybackMode | null {
+    if (!this.playingPolylineId || !this.playbackCurrentPosition) {
+      return null;
+    }
+
+    while (this.playbackActionIndex < this.playbackActions.length) {
+      const action = this.playbackActions[this.playbackActionIndex];
+      this.playbackActionIndex += 1;
+      if (action.kind === "turn") {
+        if (this.startRobotTurn(this.playbackCurrentPosition, this.playbackHeadingRad, action.headingRad)) {
+          return "turn";
+        }
+        continue;
+      }
+
+      const activeMap = this.options.getActiveMap();
+      if (!activeMap) {
+        return null;
+      }
+      const segmentLengthMm = this.segmentLengthMm(this.playbackCurrentPosition, action.point, activeMap);
+      if (segmentLengthMm <= 0.0001) {
+        this.playbackCurrentPosition = { ...action.point };
+        continue;
+      }
+
+      const moveHeadingRad = this.headingRad(this.playbackCurrentPosition, action.point);
+      if (this.startRobotTurn(this.playbackCurrentPosition, this.playbackHeadingRad, moveHeadingRad)) {
+        this.playbackActionIndex -= 1;
+        return "turn";
+      }
+
+      this.playbackMoveStart = { ...this.playbackCurrentPosition };
+      this.playbackMoveEnd = { ...action.point };
+      this.playbackMoveLengthMm = segmentLengthMm;
+      this.playbackSegmentOffsetMm = 0;
+      this.playbackHeadingRad = moveHeadingRad;
+      return "move";
+    }
+    return null;
+  }
+
+  private stepRobotMove(distanceMm: number): boolean {
+    if (!this.playingPolylineId || !this.playbackMoveStart || !this.playbackMoveEnd) {
+      return false;
+    }
+
+    this.playbackSegmentOffsetMm += distanceMm;
+    const t = Math.min(1, this.playbackSegmentOffsetMm / this.playbackMoveLengthMm);
+    const position = this.lerpPoint(this.playbackMoveStart, this.playbackMoveEnd, t);
+    this.robotPlaybackFrame = {
+      polylineId: this.playingPolylineId,
+      position,
+      headingRad: this.playbackHeadingRad,
+    };
+    this.options.requestRender();
+
+    if (t >= 1) {
+      this.playbackCurrentPosition = { ...this.playbackMoveEnd };
+      this.playbackMoveStart = null;
+      this.playbackMoveEnd = null;
+      this.playbackMoveLengthMm = 0;
+      this.playbackSegmentOffsetMm = 0;
+      return true;
+    }
+
+    this.playbackAnimationHandle = window.requestAnimationFrame(this.robotPlaybackTick);
+    return false;
+  }
 
   private stepRobotTurn(dtSec: number): void {
     if (!this.playingPolylineId || !this.playbackTurnPosition) {
@@ -219,7 +296,7 @@ export class RobotPlaybackController {
 
     this.playbackTurnProgressRad = Math.min(
       totalTurnRad,
-      this.playbackTurnProgressRad + ROBOT_TURN_SPEED_RAD_PER_SEC * this.options.getAnimationSpeedMultiplier() * dtSec,
+      this.playbackTurnProgressRad + this.turnRadPerTick(dtSec),
     );
     const rawT = this.playbackTurnProgressRad / totalTurnRad;
     const easedT = easeInOut(rawT);
@@ -243,7 +320,6 @@ export class RobotPlaybackController {
     position: PointPx,
     fromHeadingRad: number,
     toHeadingRad: number,
-    nextSegmentIndex: number,
   ): boolean {
     const turnDeltaRad = shortestAngleDeltaRad(fromHeadingRad, toHeadingRad);
     if (Math.abs(turnDeltaRad) < MIN_ROBOT_TURN_ANGLE_RAD) {
@@ -251,7 +327,6 @@ export class RobotPlaybackController {
     }
 
     this.playbackMode = "turn";
-    this.playbackSegmentIndex = nextSegmentIndex;
     this.playbackSegmentOffsetMm = 0;
     this.playbackTurnFromHeadingRad = fromHeadingRad;
     this.playbackTurnDeltaRad = turnDeltaRad;
@@ -263,9 +338,10 @@ export class RobotPlaybackController {
   private finishRobotTurn(): void {
     this.playbackMode = "move";
     if (this.robotPlaybackFrame) {
+      this.playbackHeadingRad = normalizeAngleRad(this.playbackTurnFromHeadingRad + this.playbackTurnDeltaRad);
       this.robotPlaybackFrame = {
         ...this.robotPlaybackFrame,
-        headingRad: normalizeAngleRad(this.playbackTurnFromHeadingRad + this.playbackTurnDeltaRad),
+        headingRad: this.playbackHeadingRad,
       };
     }
     this.resetRobotTurnState();
@@ -279,11 +355,11 @@ export class RobotPlaybackController {
   }
 
   private finishRobotPlayback(polyline: Polyline): void {
-    const finalPoint = polyline.points[polyline.points.length - 1];
+    const finalPoint = this.playbackCurrentPosition ?? polyline.points[polyline.points.length - 1];
     this.robotPlaybackFrame = {
       polylineId: polyline.id,
       position: { ...finalPoint },
-      headingRad: this.lastHeadingRad(polyline.points),
+      headingRad: this.playbackHeadingRad,
     };
     this.cancelPlaybackAnimationFrame();
     this.playingPolylineId = null;
@@ -291,15 +367,6 @@ export class RobotPlaybackController {
     this.resetRobotTurnState();
     this.playbackLastTimestampMs = 0;
     this.options.onPlaybackStateChange();
-  }
-
-  private findNextPlayableSegment(points: PointPx[], startIndex: number, map: LoadedMap): number | null {
-    for (let index = startIndex; index < points.length - 1; index += 1) {
-      if (this.segmentLengthMm(points[index], points[index + 1], map) > 0.0001) {
-        return index;
-      }
-    }
-    return null;
   }
 
   private segmentLengthMm(start: PointPx, end: PointPx, map: LoadedMap): number {
@@ -312,17 +379,6 @@ export class RobotPlaybackController {
     return Math.atan2(end.y - start.y, end.x - start.x);
   }
 
-  private lastHeadingRad(points: PointPx[]): number {
-    for (let index = points.length - 2; index >= 0; index -= 1) {
-      const start = points[index];
-      const end = points[index + 1];
-      if (Math.hypot(end.x - start.x, end.y - start.y) > 0.0001) {
-        return this.headingRad(start, end);
-      }
-    }
-    return 0;
-  }
-
   private lerpPoint(start: PointPx, end: PointPx, t: number): PointPx {
     return {
       x: start.x + (end.x - start.x) * t,
@@ -332,6 +388,10 @@ export class RobotPlaybackController {
 
   private normalizeDriveSpeed(speed: number): number {
     return Math.max(0, Math.min(MAX_DRIVE_SPEED, Math.round(speed)));
+  }
+
+  private turnRadPerTick(dtSec: number): number {
+    return ROBOT_TURN_SPEED_RAD_PER_SEC * Math.sqrt(this.options.getAnimationSpeedMultiplier()) * dtSec;
   }
 }
 

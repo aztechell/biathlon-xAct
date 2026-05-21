@@ -18,6 +18,10 @@ export interface SessionReplacement {
   robotHeightMm: number;
 }
 
+export interface AutosaveReplacement extends SessionReplacement {
+  draftPolyline: PointPx[];
+}
+
 const DEFAULT_VIEW: ViewState = {
   zoom: 1,
   panX: 0,
@@ -63,13 +67,14 @@ export class AppStore {
     view: { ...DEFAULT_VIEW },
     pointerWorld: null,
     polylinePreviewWorld: null,
-    toolMode: "pan",
+    toolMode: "polyline",
     polylineSettings: {
       orthoVh: false,
       round10mm: true,
       showPointCoordinates: false,
-      coordinateMode: "absolute",
-      driveSpeed: 100,
+      coordinateMode: "relative",
+      initialHeadingDeg: 0,
+      driveSpeed: 90,
       animationSpeedMultiplier: 2,
     },
     robotEnabled: false,
@@ -183,6 +188,35 @@ export class AppStore {
     this.clearContinuationState();
     this.lastRemovedPolyline = null;
     this.emit();
+  }
+
+  replaceAutosaveData(data: AutosaveReplacement): void {
+    this.state.polylines = clonePolylines(data.polylines.filter((polyline) => polyline.points.length >= 2));
+    this.state.draftPolyline = clonePoints(data.draftPolyline);
+    this.state.polylinePreviewWorld = null;
+    this.state.polylineSettings = { ...data.polylineSettings };
+    this.state.robotEnabled = data.robotEnabled;
+    this.state.robotWidthMm = data.robotWidthMm;
+    this.state.robotHeightMm = data.robotHeightMm;
+    this.clearContinuationState();
+    this.lastRemovedPolyline = null;
+    this.emit();
+  }
+
+  replaceWithPolylines(pointGroups: PointPx[][]): Polyline[] {
+    const polylines = pointGroups
+      .filter((points) => points.length >= 2)
+      .map((points, index) => ({
+        id: this.state.polylines[index]?.id ?? `polyline-${Date.now()}-${index + 1}`,
+        points: clonePoints(points),
+      }));
+    this.state.polylines = polylines;
+    this.state.draftPolyline = [];
+    this.state.polylinePreviewWorld = null;
+    this.clearContinuationState();
+    this.lastRemovedPolyline = null;
+    this.emit();
+    return clonePolylines(polylines);
   }
 
   addDraftPolylinePoint(point: PointPx): void {

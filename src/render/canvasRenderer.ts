@@ -1,6 +1,15 @@
 import { mmPerPxX, mmPerPxY, worldToCoordinateModeMm, worldToScreen } from "../geometry/measure";
 import type { LoadedMap } from "../io/mapConfig";
-import type { CoordinateMode, MapSpec, PointPx, Polyline, RobotPlaybackFrame, ViewState } from "../state/types";
+import type {
+  CoordinateMode,
+  MapSpec,
+  PointPx,
+  Polyline,
+  RobotInitialHeadingMarker,
+  RobotPlaybackFrame,
+  RobotTurnMarker,
+  ViewState,
+} from "../state/types";
 
 export interface RenderScene {
   map: LoadedMap | null;
@@ -16,6 +25,8 @@ export interface RenderScene {
   robotWidthMm: number;
   robotHeightMm: number;
   robotPlayback: RobotPlaybackFrame | null;
+  robotInitialHeading: RobotInitialHeadingMarker | null;
+  robotTurnMarkers: RobotTurnMarker[];
 }
 
 export class CanvasRenderer {
@@ -75,7 +86,16 @@ export class CanvasRenderer {
       view.zoom,
       scene.showPointCoordinates,
       scene.coordinateMode,
+      !scene.robotInitialHeading?.isPreview,
     );
+    this.drawRobotInitialHeading(
+      scene.robotInitialHeading,
+      map.spec,
+      view.zoom,
+      scene.robotWidthMm,
+      scene.robotHeightMm,
+    );
+    this.drawRobotTurnMarkers(scene.robotTurnMarkers, view.zoom, scene.showPointCoordinates);
     this.drawMapBorder(view.zoom, map.spec.imgWidthPx, map.spec.imgHeightPx);
     this.drawRobotOverlay(
       scene.pointerWorld,
@@ -91,7 +111,8 @@ export class CanvasRenderer {
     if (scene.showPointer && scene.pointerWorld) {
       this.drawPointerCrosshair(scene.pointerWorld, view);
       if (this.isInsideMap(scene.pointerWorld, map)) {
-        const originPoint = scene.coordinateMode === "relative" ? scene.draftPolyline[0] ?? null : null;
+        const originPoint =
+          scene.coordinateMode === "relative" ? scene.draftPolyline[0] ?? scene.polylines[0]?.points[0] ?? null : null;
         this.drawPointerBadge(scene.pointerWorld, map, view, scene.coordinateMode, originPoint);
       }
     }
@@ -115,6 +136,7 @@ export class CanvasRenderer {
     zoom: number,
     showPointCoordinates: boolean,
     coordinateMode: CoordinateMode,
+    showDraftPreview: boolean,
   ): void {
     for (const polyline of polylines) {
       this.drawPolyline(polyline.points, map, zoom, false, showPointCoordinates, coordinateMode);
@@ -122,7 +144,7 @@ export class CanvasRenderer {
 
     if (draftPolyline.length > 0) {
       this.drawPolyline(draftPolyline, map, zoom, true, showPointCoordinates, coordinateMode);
-      if (pointerWorld) {
+      if (pointerWorld && showDraftPreview) {
         this.drawDraftPreview(draftPolyline[draftPolyline.length - 1], pointerWorld, zoom);
       }
     }
@@ -175,6 +197,155 @@ export class CanvasRenderer {
         this.drawPointCoordinateLabel(point, map, zoom, isDraft, index, coordinateMode, originPoint);
       });
     }
+    ctx.restore();
+  }
+
+  private drawRobotInitialHeading(
+    marker: RobotInitialHeadingMarker | null,
+    map: MapSpec,
+    zoom: number,
+    robotWidthMm: number,
+    robotHeightMm: number,
+  ): void {
+    if (!marker) {
+      return;
+    }
+
+    const ctx = this.ctx;
+    const xMmPerPx = mmPerPxX(map);
+    const yMmPerPx = mmPerPxY(map);
+    const widthPx = robotWidthMm / xMmPerPx;
+    const heightPx = robotHeightMm / yMmPerPx;
+    const radius = 4.5 / zoom;
+    const arrowLength = marker.isPreview ? 42 / zoom : 34 / zoom;
+    const arrowHeadLength = 10 / zoom;
+    const arrowHeadWidth = 6 / zoom;
+    const startX = marker.position.x;
+    const startY = marker.position.y;
+    const endX = startX + Math.cos(marker.headingRad) * arrowLength;
+    const endY = startY + Math.sin(marker.headingRad) * arrowLength;
+    const backX = endX - Math.cos(marker.headingRad) * arrowHeadLength;
+    const backY = endY - Math.sin(marker.headingRad) * arrowHeadLength;
+    const normalX = -Math.sin(marker.headingRad);
+    const normalY = Math.cos(marker.headingRad);
+
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    if (
+      Number.isFinite(widthPx) &&
+      Number.isFinite(heightPx) &&
+      widthPx > 0 &&
+      heightPx > 0
+    ) {
+      ctx.save();
+      ctx.translate(startX, startY);
+      ctx.rotate(marker.headingRad);
+      ctx.fillStyle = marker.isPreview ? "rgba(34, 197, 94, 0.12)" : "rgba(34, 197, 94, 0.18)";
+      ctx.strokeStyle = marker.isPreview ? "rgba(22, 163, 74, 0.45)" : "rgba(22, 163, 74, 0.78)";
+      ctx.lineWidth = 1.3 / zoom;
+      ctx.setLineDash([7 / zoom, 5 / zoom]);
+      ctx.fillRect(-widthPx * 0.5, -heightPx * 0.5, widthPx, heightPx);
+      ctx.strokeRect(-widthPx * 0.5, -heightPx * 0.5, widthPx, heightPx);
+      ctx.restore();
+    }
+
+    ctx.strokeStyle = marker.isPreview ? "rgba(22, 163, 74, 0.58)" : "rgba(22, 163, 74, 0.96)";
+    ctx.fillStyle = marker.isPreview ? "rgba(22, 163, 74, 0.58)" : "rgba(22, 163, 74, 0.96)";
+    ctx.lineWidth = 2.4 / zoom;
+    if (marker.isPreview) {
+      ctx.setLineDash([6 / zoom, 5 / zoom]);
+    }
+    ctx.beginPath();
+    ctx.moveTo(startX, startY);
+    ctx.lineTo(endX, endY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(endX, endY);
+    ctx.lineTo(backX + normalX * arrowHeadWidth, backY + normalY * arrowHeadWidth);
+    ctx.lineTo(backX - normalX * arrowHeadWidth, backY - normalY * arrowHeadWidth);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(startX, startY, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  private drawRobotTurnMarkers(markers: RobotTurnMarker[], zoom: number, showLabels: boolean): void {
+    if (markers.length === 0) {
+      return;
+    }
+
+    const ctx = this.ctx;
+    const radius = 4 / zoom;
+    const arrowLength = 28 / zoom;
+    const arrowHeadLength = 9 / zoom;
+    const arrowHeadWidth = 5 / zoom;
+
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.font = `${11 / zoom}px 'Segoe UI', sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+
+    for (const marker of markers) {
+      const x = marker.position.x;
+      const y = marker.position.y;
+      const endX = x + Math.cos(marker.headingRad) * arrowLength;
+      const endY = y + Math.sin(marker.headingRad) * arrowLength;
+      const backX = endX - Math.cos(marker.headingRad) * arrowHeadLength;
+      const backY = endY - Math.sin(marker.headingRad) * arrowHeadLength;
+      const normalX = -Math.sin(marker.headingRad);
+      const normalY = Math.cos(marker.headingRad);
+      const leftX = backX + normalX * arrowHeadWidth;
+      const leftY = backY + normalY * arrowHeadWidth;
+      const rightX = backX - normalX * arrowHeadWidth;
+      const rightY = backY - normalY * arrowHeadWidth;
+
+      ctx.fillStyle = "rgba(249, 115, 22, 0.98)";
+      ctx.strokeStyle = "rgba(249, 115, 22, 0.98)";
+      ctx.lineWidth = 1.8 / zoom;
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = "rgba(249, 115, 22, 0.98)";
+      ctx.fillStyle = "rgba(249, 115, 22, 0.98)";
+      ctx.lineWidth = 2 / zoom;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(endX, endY);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(endX, endY);
+      ctx.lineTo(leftX, leftY);
+      ctx.lineTo(rightX, rightY);
+      ctx.closePath();
+      ctx.fill();
+
+      if (!showLabels) {
+        continue;
+      }
+
+      const label = `turn ${Math.round(marker.headingDeg)}`;
+      const labelX = x + 10 / zoom;
+      const labelY = y - 16 / zoom;
+      const metrics = ctx.measureText(label);
+      const width = metrics.width + 10 / zoom;
+      const height = 18 / zoom;
+      ctx.fillStyle = "rgba(255, 251, 235, 0.94)";
+      ctx.strokeStyle = "rgba(180, 83, 9, 0.72)";
+      ctx.lineWidth = 1 / zoom;
+      this.addRoundedRectPath(labelX, labelY, width, height, 5 / zoom);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#78350f";
+      ctx.fillText(label, labelX + 5 / zoom, labelY + height * 0.5);
+    }
+
     ctx.restore();
   }
 
